@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -11,10 +10,10 @@ import (
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/projectdiscovery/fileutil"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/interactsh/pkg/filewatcher"
-	"github.com/projectdiscovery/stringsutil"
+	fileutil "github.com/projectdiscovery/utils/file"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 var responderMonitorList map[string]string = map[string]string{
@@ -41,8 +40,12 @@ func NewResponderServer(options *Options) (*ResponderServer, error) {
 }
 
 // ListenAndServe listens on various responder ports
-func (h *ResponderServer) ListenAndServe() error {
-	tmpFolder, err := ioutil.TempDir("", "")
+func (h *ResponderServer) ListenAndServe(responderAlive chan bool) error {
+	responderAlive <- true
+	defer func() {
+		responderAlive <- false
+	}()
+	tmpFolder, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
@@ -80,7 +83,11 @@ func (h *ResponderServer) ListenAndServe() error {
 		for data := range ch {
 			for searchTerm, extractAfter := range responderMonitorList {
 				if strings.Contains(data, searchTerm) {
-					responderData := stringsutil.After(data, extractAfter)
+					responderData, err := stringsutil.After(data, extractAfter)
+					if err != nil {
+						gologger.Warning().Msgf("Could not get responder interaction: %s\n", err)
+						continue
+					}
 
 					// Correlation id doesn't apply here, we skip encryption
 					interaction := &Interaction{

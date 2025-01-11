@@ -3,28 +3,33 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/gologger/levels"
-	"github.com/projectdiscovery/interactsh/pkg/server/acme"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 // HTTPServer is a http server instance that listens both
 // TLS and Non-TLS based servers.
 type HTTPServer struct {
-	options      *Options
-	domain       string
-	tlsserver    http.Server
-	nontlsserver http.Server
+	options       *Options
+	tlsserver     http.Server
+	nontlsserver  http.Server
+	customBanner  string
+	staticHandler http.Handler
 }
 
 type noopLogger struct {
@@ -34,38 +39,67 @@ func (l *noopLogger) Write(p []byte) (n int, err error) {
 	return 0, nil
 }
 
+// disableDirectoryListing disables directory listing on http.FileServer
+func disableDirectoryListing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/") || r.URL.Path == "" {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // NewHTTPServer returns a new TLS & Non-TLS HTTP server.
 func NewHTTPServer(options *Options) (*HTTPServer, error) {
-	gologger.DefaultLogger.SetMaxLevel(levels.LevelDebug)
+	server := &HTTPServer{options: options}
 
-	server := &HTTPServer{options: options, domain: strings.TrimSuffix(options.Domain, ".")}
-
+	// If a static directory is specified, also serve it.
+	if options.HTTPDirectory != "" {
+		abs, _ := filepath.Abs(options.HTTPDirectory)
+		gologger.Info().Msgf("Loading directory (%s) to serve from : %s/s/", abs, strings.Join(options.Domains, ","))
+		server.staticHandler = http.StripPrefix("/s/", disableDirectoryListing(http.FileServer(http.Dir(options.HTTPDirectory))))
+	}
+	// If custom index, read the custom index file and serve it.
+	// Supports {DOMAIN} placeholders.
+	if options.HTTPIndex != "" {
+		abs, _ := filepath.Abs(options.HTTPDirectory)
+		gologger.Info().Msgf("Using custom server index: %s", abs)
+		if data, err := os.ReadFile(options.HTTPIndex); err == nil {
+			server.customBanner = string(data)
+		}
+	}
 	router := &http.ServeMux{}
-	router.Handle("/", server.logger(http.HandlerFunc(server.defaultHandler)))
+	router.Handle("/", server.logger(server.corsMiddleware(http.HandlerFunc(server.defaultHandler))))
 	router.Handle("/register", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.registerHandler))))
 	router.Handle("/deregister", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.deregisterHandler))))
 	router.Handle("/poll", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.pollHandler))))
-	router.Handle("/metrics", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.metricsHandler))))
-	server.tlsserver = http.Server{Addr: options.ListenIP + ":443", Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
-	server.nontlsserver = http.Server{Addr: options.ListenIP + ":80", Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
+	if server.options.EnableMetrics {
+		router.Handle("/metrics", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.metricsHandler))))
+	}
+	server.tlsserver = http.Server{Addr: options.ListenIP + fmt.Sprintf(":%d", options.HttpsPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
+	server.nontlsserver = http.Server{Addr: options.ListenIP + fmt.Sprintf(":%d", options.HttpPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
 	return server, nil
 }
 
 // ListenAndServe listens on http and/or https ports for the server.
-func (h *HTTPServer) ListenAndServe(autoTLS *acme.AutoTLS) {
+func (h *HTTPServer) ListenAndServe(tlsConfig *tls.Config, httpAlive, httpsAlive chan bool) {
 	go func() {
-		if autoTLS == nil {
+		if tlsConfig == nil {
 			return
 		}
-		h.tlsserver.TLSConfig = &tls.Config{}
-		h.tlsserver.TLSConfig.GetCertificate = autoTLS.GetCertificateFunc()
+		h.tlsserver.TLSConfig = tlsConfig
 
+		httpsAlive <- true
 		if err := h.tlsserver.ListenAndServeTLS("", ""); err != nil {
 			gologger.Error().Msgf("Could not serve http on tls: %s\n", err)
+			httpsAlive <- false
 		}
 	}()
 
+	httpAlive <- true
 	if err := h.nontlsserver.ListenAndServe(); err != nil {
+		httpAlive <- false
 		gologger.Error().Msgf("Could not serve http: %s\n", err)
 	}
 }
@@ -75,12 +109,12 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 		req, _ := httputil.DumpRequest(r, true)
 		reqString := string(req)
 
-		gologger.Debug().Msgf("New HTTP request: %s\n", reqString)
+		gologger.Debug().Msgf("New HTTP request: \n\n%s\n", reqString)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, r)
 
 		resp, _ := httputil.DumpResponse(rec.Result(), true)
-		resoString := string(resp)
+		respString := string(resp)
 
 		for k, v := range rec.Header() {
 			w.Header()[k] = v
@@ -90,93 +124,224 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 		w.WriteHeader(rec.Result().StatusCode)
 		_, _ = w.Write(data)
 
+		var host string
+		// Check if the client's ip should be taken from a custom header (eg reverse proxy)
+		if originIP := r.Header.Get(h.options.OriginIPHeader); originIP != "" {
+			host = originIP
+		} else {
+			host, _, _ = net.SplitHostPort(r.RemoteAddr)
+		}
+
 		// if root-tld is enabled stores any interaction towards the main domain
-		if h.options.RootTLD && strings.HasSuffix(r.Host, h.domain) {
-			ID := h.domain
-			host, _, _ := net.SplitHostPort(r.RemoteAddr)
-			interaction := &Interaction{
-				Protocol:      "http",
-				UniqueID:      r.Host,
-				FullId:        r.Host,
-				RawRequest:    reqString,
-				RawResponse:   resoString,
-				RemoteAddress: host,
-				Timestamp:     time.Now(),
-			}
-			buffer := &bytes.Buffer{}
-			if err := jsoniter.NewEncoder(buffer).Encode(interaction); err != nil {
-				gologger.Warning().Msgf("Could not encode root tld http interaction: %s\n", err)
-			} else {
-				gologger.Debug().Msgf("Root TLD HTTP Interaction: \n%s\n", buffer.String())
-				if err := h.options.Storage.AddInteractionWithId(ID, buffer.Bytes()); err != nil {
-					gologger.Warning().Msgf("Could not store root tld http interaction: %s\n", err)
+		if h.options.RootTLD {
+			for _, domain := range h.options.Domains {
+				if h.options.RootTLD && stringsutil.HasSuffixI(r.Host, domain) {
+					ID := domain
+					host, _, _ := net.SplitHostPort(r.RemoteAddr)
+					interaction := &Interaction{
+						Protocol:      "http",
+						UniqueID:      r.Host,
+						FullId:        r.Host,
+						RawRequest:    reqString,
+						RawResponse:   respString,
+						RemoteAddress: host,
+						Timestamp:     time.Now(),
+					}
+					buffer := &bytes.Buffer{}
+					if err := jsoniter.NewEncoder(buffer).Encode(interaction); err != nil {
+						gologger.Warning().Msgf("Could not encode root tld http interaction: %s\n", err)
+					} else {
+						gologger.Debug().Msgf("Root TLD HTTP Interaction: \n%s\n", buffer.String())
+						if err := h.options.Storage.AddInteractionWithId(ID, buffer.Bytes()); err != nil {
+							gologger.Warning().Msgf("Could not store root tld http interaction: %s\n", err)
+						}
+					}
 				}
 			}
 		}
 
-		var uniqueID, fullID string
-		parts := strings.Split(r.Host, ".")
-		for i, part := range parts {
-			if len(part) == 33 {
-				uniqueID = part
-				fullID = part
-				if i+1 <= len(parts) {
-					fullID = strings.Join(parts[:i+1], ".")
+		if h.options.ScanEverywhere {
+			chunks := stringsutil.SplitAny(reqString, ".\n\t\"'")
+			for _, chunk := range chunks {
+				for part := range stringsutil.SlideWithLength(chunk, h.options.GetIdLength()) {
+					normalizedPart := strings.ToLower(part)
+					if h.options.isCorrelationID(normalizedPart) {
+						h.handleInteraction(normalizedPart, part, reqString, respString, host)
+					}
 				}
 			}
-		}
-		if uniqueID != "" {
-			correlationID := uniqueID[:20]
-
-			host, _, _ := net.SplitHostPort(r.RemoteAddr)
-			interaction := &Interaction{
-				Protocol:      "http",
-				UniqueID:      uniqueID,
-				FullId:        fullID,
-				RawRequest:    reqString,
-				RawResponse:   resoString,
-				RemoteAddress: host,
-				Timestamp:     time.Now(),
-			}
-			buffer := &bytes.Buffer{}
-			if err := jsoniter.NewEncoder(buffer).Encode(interaction); err != nil {
-				gologger.Warning().Msgf("Could not encode http interaction: %s\n", err)
-			} else {
-				gologger.Debug().Msgf("HTTP Interaction: \n%s\n", buffer.String())
-				if err := h.options.Storage.AddInteraction(correlationID, buffer.Bytes()); err != nil {
-					gologger.Warning().Msgf("Could not store http interaction: %s\n", err)
+		} else {
+			parts := strings.Split(r.Host, ".")
+			for i, part := range parts {
+				for partChunk := range stringsutil.SlideWithLength(part, h.options.GetIdLength()) {
+					normalizedPartChunk := strings.ToLower(partChunk)
+					if h.options.isCorrelationID(normalizedPartChunk) {
+						fullID := part
+						if i+1 <= len(parts) {
+							fullID = strings.Join(parts[:i+1], ".")
+						}
+						h.handleInteraction(normalizedPartChunk, fullID, reqString, respString, host)
+					}
 				}
 			}
 		}
 	}
 }
 
+func (h *HTTPServer) handleInteraction(uniqueID, fullID, reqString, respString, hostPort string) {
+	correlationID := uniqueID[:h.options.CorrelationIdLength]
+
+	interaction := &Interaction{
+		Protocol:      "http",
+		UniqueID:      uniqueID,
+		FullId:        fullID,
+		RawRequest:    reqString,
+		RawResponse:   respString,
+		RemoteAddress: hostPort,
+		Timestamp:     time.Now(),
+	}
+	buffer := &bytes.Buffer{}
+	if err := jsoniter.NewEncoder(buffer).Encode(interaction); err != nil {
+		gologger.Warning().Msgf("Could not encode http interaction: %s\n", err)
+	} else {
+		gologger.Debug().Msgf("HTTP Interaction: \n%s\n", buffer.String())
+
+		if err := h.options.Storage.AddInteraction(correlationID, buffer.Bytes()); err != nil {
+			gologger.Warning().Msgf("Could not store http interaction: %s\n", err)
+		}
+	}
+}
+
 const banner = `<h1> Interactsh Server </h1>
 
-<a href='https://github.com/projectdiscovery/interactsh'>Interactsh</a> is an <b>open-source solution</b> for out-of-band data extraction. It is a tool designed to detect bugs that cause external interactions. These bugs include, Blind SQLi, Blind CMDi, SSRF, etc. <br><br>
+<a href='https://github.com/projectdiscovery/interactsh'><b>Interactsh</b></a> is an open-source tool for detecting out-of-band interactions. It is a tool designed to detect vulnerabilities that cause external interactions.<br><br>
 
-If you find communications or exchanges with the <b>%s</b> server in your logs, it is possible that someone has been testing your applications.<br><br>
+If you notice any interactions from <b>*.%s</b> in your logs, it's possible that someone (internal security engineers, pen-testers, bug-bounty hunters) has been testing your application.<br><br>
 
-You should review the time when these interactions were initiated to identify the person responsible for this testing.
+You should investigate the sites where these interactions were generated from, and if a vulnerability exists, examine the root cause and take the necessary steps to mitigate the issue.
 `
+
+func extractServerDomain(h *HTTPServer, req *http.Request) string {
+	if h.options.HeaderServer != "" {
+		return h.options.HeaderServer
+	}
+
+	var domain string
+	// use first domain as default (todo: should be extracted from certificate)
+	if len(h.options.Domains) > 0 {
+		// attempts to extract the domain name from host header
+		for _, configuredDomain := range h.options.Domains {
+			if stringsutil.HasSuffixI(req.Host, configuredDomain) {
+				domain = configuredDomain
+				break
+			}
+		}
+		// fallback to first domain in case of unknown host header
+		if domain == "" {
+			domain = h.options.Domains[0]
+		}
+	}
+	return domain
+}
 
 // defaultHandler is a handler for default collaborator requests
 func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
-	reflection := URLReflection(req.Host)
-	w.Header().Set("Server", h.domain)
+	atomic.AddUint64(&h.options.Stats.Http, 1)
 
-	if req.URL.Path == "/" && reflection == "" {
-		fmt.Fprintf(w, banner, h.domain)
+	domain := extractServerDomain(h, req)
+	w.Header().Set("Server", domain)
+	if !h.options.NoVersionHeader {
+		w.Header().Set("X-Interactsh-Version", h.options.Version)
+	}
+
+	reflection := h.options.URLReflection(req.Host)
+	if stringsutil.HasPrefixI(req.URL.Path, "/s/") && h.staticHandler != nil {
+		if h.options.DynamicResp && len(req.URL.Query()) > 0 {
+			values := req.URL.Query()
+			if headers := values["header"]; len(headers) > 0 {
+				for _, header := range headers {
+					if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
+						w.Header().Add(headerParts[0], headerParts[1])
+					}
+				}
+			}
+			if delay := values.Get("delay"); delay != "" {
+				if parsed, err := strconv.Atoi(delay); err == nil {
+					time.Sleep(time.Duration(parsed) * time.Second)
+				}
+			}
+			if status := values.Get("status"); status != "" {
+				if parsed, err := strconv.Atoi(status); err == nil {
+					w.WriteHeader(parsed)
+				}
+			}
+		}
+		h.staticHandler.ServeHTTP(w, req)
+	} else if req.URL.Path == "/" && reflection == "" {
+		if h.customBanner != "" {
+			fmt.Fprint(w, strings.ReplaceAll(h.customBanner, "{DOMAIN}", domain))
+		} else {
+			fmt.Fprintf(w, banner, domain)
+		}
 	} else if strings.EqualFold(req.URL.Path, "/robots.txt") {
 		fmt.Fprintf(w, "User-agent: *\nDisallow: / # %s", reflection)
-	} else if strings.HasSuffix(req.URL.Path, ".json") {
+	} else if stringsutil.HasSuffixI(req.URL.Path, ".json") {
 		fmt.Fprintf(w, "{\"data\":\"%s\"}", reflection)
 		w.Header().Set("Content-Type", "application/json")
-	} else if strings.HasSuffix(req.URL.Path, ".xml") {
+	} else if stringsutil.HasSuffixI(req.URL.Path, ".xml") {
 		fmt.Fprintf(w, "<data>%s</data>", reflection)
 		w.Header().Set("Content-Type", "application/xml")
 	} else {
+		if h.options.DynamicResp && (len(req.URL.Query()) > 0 || stringsutil.HasPrefixI(req.URL.Path, "/b64_body:")) {
+			writeResponseFromDynamicRequest(w, req)
+			return
+		}
 		fmt.Fprintf(w, "<html><head></head><body>%s</body></html>", reflection)
+	}
+}
+
+// writeResponseFromDynamicRequest writes a response to http.ResponseWriter
+// based on dynamic data from HTTP URL Query parameters.
+//
+// The following parameters are supported -
+//
+//	body (response body)
+//	header (response header)
+//	status (response status code)
+//	delay (response time)
+func writeResponseFromDynamicRequest(w http.ResponseWriter, req *http.Request) {
+	values := req.URL.Query()
+
+	if stringsutil.HasPrefixI(req.URL.Path, "/b64_body:") {
+		firstindex := strings.Index(req.URL.Path, "/b64_body:")
+		lastIndex := strings.LastIndex(req.URL.Path, "/")
+
+		decodedBytes, _ := base64.StdEncoding.DecodeString(req.URL.Path[firstindex+10 : lastIndex])
+		_, _ = w.Write(decodedBytes)
+
+	}
+	if headers := values["header"]; len(headers) > 0 {
+		for _, header := range headers {
+			if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
+				w.Header().Add(headerParts[0], headerParts[1])
+			}
+		}
+	}
+	if delay := values.Get("delay"); delay != "" {
+		parsed, _ := strconv.Atoi(delay)
+		time.Sleep(time.Duration(parsed) * time.Second)
+	}
+	if status := values.Get("status"); status != "" {
+		parsed, _ := strconv.Atoi(status)
+		w.WriteHeader(parsed)
+	}
+	if body := values.Get("body"); body != "" {
+		_, _ = w.Write([]byte(body))
+	}
+
+	if b64_body := values.Get("b64_body"); b64_body != "" {
+		decodedBytes, _ := base64.StdEncoding.DecodeString(string([]byte(b64_body)))
+		_, _ = w.Write(decodedBytes)
 	}
 }
 
@@ -198,6 +363,9 @@ func (h *HTTPServer) registerHandler(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, fmt.Sprintf("could not decode json body: %s", err), http.StatusBadRequest)
 		return
 	}
+
+	atomic.AddInt64(&h.options.Stats.Sessions, 1)
+
 	if err := h.options.Storage.SetIDPublicKey(r.CorrelationID, r.SecretKey, r.PublicKey); err != nil {
 		gologger.Warning().Msgf("Could not set id and public key for %s: %s\n", r.CorrelationID, err)
 		jsonError(w, fmt.Sprintf("could not set id and public key: %s", err), http.StatusBadRequest)
@@ -217,12 +385,15 @@ type DeregisterRequest struct {
 
 // deregisterHandler is a handler for client deregister requests
 func (h *HTTPServer) deregisterHandler(w http.ResponseWriter, req *http.Request) {
+	atomic.AddInt64(&h.options.Stats.Sessions, -1)
+
 	r := &DeregisterRequest{}
 	if err := jsoniter.NewDecoder(req.Body).Decode(r); err != nil {
 		gologger.Warning().Msgf("Could not decode json body: %s\n", err)
 		jsonError(w, fmt.Sprintf("could not decode json body: %s", err), http.StatusBadRequest)
 		return
 	}
+
 	if err := h.options.Storage.RemoveID(r.CorrelationID, r.SecretKey); err != nil {
 		gologger.Warning().Msgf("Could not remove id for %s: %s\n", r.CorrelationID, err)
 		jsonError(w, fmt.Sprintf("could not remove id: %s", err), http.StatusBadRequest)
@@ -261,10 +432,17 @@ func (h *HTTPServer) pollHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// At this point the client is authenticated, so we return also the data related to the auth token
-	extradata, _ := h.options.Storage.GetInteractionsWithId(h.options.Token)
-	var tlddata []string
+	var tlddata, extradata []string
 	if h.options.RootTLD {
-		tlddata, _ = h.options.Storage.GetInteractionsWithId(h.options.Domain)
+		for _, domain := range h.options.Domains {
+			interactions, _ := h.options.Storage.GetInteractionsWithId(domain)
+			// root domains interaction are not encrypted
+			tlddata = append(tlddata, interactions...)
+		}
+	}
+	if h.options.Token != "" {
+		// auth token interactions are not encrypted
+		extradata, _ = h.options.Storage.GetInteractionsWithId(h.options.Token)
 	}
 	response := &PollResponse{Data: data, AESKey: aesKey, TLDData: tlddata, Extra: extradata}
 
@@ -324,9 +502,13 @@ func (h *HTTPServer) checkToken(req *http.Request) bool {
 
 // metricsHandler is a handler for /metrics endpoint
 func (h *HTTPServer) metricsHandler(w http.ResponseWriter, req *http.Request) {
-	metrics := h.options.Storage.GetCacheMetrics()
+	interactMetrics := h.options.Stats
+	interactMetrics.Cache = GetCacheMetrics(h.options)
+	interactMetrics.Cpu = GetCpuMetrics()
+	interactMetrics.Memory = GetMemoryMetrics()
+	interactMetrics.Network = GetNetworkMetrics()
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_ = jsoniter.NewEncoder(w).Encode(metrics)
+	_ = jsoniter.NewEncoder(w).Encode(interactMetrics)
 }

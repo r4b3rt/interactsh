@@ -52,9 +52,8 @@ func process() error {
 
 func benchmarkServer() {
 	client, err := client.New(&client.Options{
-		ServerURL:         *serverURL,
-		PersistentSession: false,
-		Token:             *token,
+		ServerURL: *serverURL,
+		Token:     *token,
 	})
 	if err != nil {
 		errors++
@@ -62,7 +61,10 @@ func benchmarkServer() {
 		return
 	}
 
-	dnsClient := retryabledns.New([]string{*serverIP + ":53"}, 1)
+	dnsClient, err := retryabledns.New([]string{*serverIP + ":53"}, 1)
+	if err != nil {
+		log.Fatal(err)
+	}
 	for i := 0; i < *pollCount; i++ {
 		client.URL()
 
